@@ -7,7 +7,7 @@ or provider is unavailable.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/obaidregens/restart/main/restart | sh
+curl -fsSL https://raw.githubusercontent.com/obaidregens/restart/refs/heads/main/restart | sh
 ```
 
 Open a new terminal after installation.

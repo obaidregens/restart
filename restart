@@ -3,7 +3,7 @@
 # This file is the installer, runtime command, and sourceable shell wrapper.
 
 RESTART_VERSION=0.1.0
-RESTART_SOURCE_URL=${RESTART_SOURCE_URL:-https://raw.githubusercontent.com/obaidregens/restart/main/restart}
+RESTART_SOURCE_URL=${RESTART_SOURCE_URL:-https://raw.githubusercontent.com/obaidregens/restart/refs/heads/main/restart}
 RESTART_HOME=${RESTART_HOME:-"$HOME/.local/share/restart"}
 RESTART_PROGRAM="$RESTART_HOME/restart"
 RESTART_BIN=${RESTART_BIN:-"$HOME/.local/bin/restart"}
