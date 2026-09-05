@@ -1,0 +1,540 @@
+#!/bin/sh
+# restart: restart Claude Code or Codex and resume the exact live conversation.
+# This file is the installer, runtime command, and sourceable shell wrapper.
+
+RESTART_VERSION=0.1.0
+RESTART_SOURCE_URL=${RESTART_SOURCE_URL:-https://raw.githubusercontent.com/obaidregens/restart/main/restart}
+RESTART_HOME=${RESTART_HOME:-"$HOME/.local/share/restart"}
+RESTART_PROGRAM="$RESTART_HOME/restart"
+RESTART_BIN=${RESTART_BIN:-"$HOME/.local/bin/restart"}
+RESTART_STATE=${RESTART_STATE:-"$HOME/.local/state/restart"}
+RESTART_BEGIN='# >>> restart >>>'
+RESTART_END='# <<< restart <<<'
+
+_agent_restart_uuid() {
+  [ "${#1}" -eq 36 ] || return 1
+  case "$1" in *[!0-9A-Fa-f-]*) return 1 ;; esac
+  return 0
+}
+
+_agent_restart_function_exists() {
+  case "$(type "$1" 2>/dev/null)" in *function*) return 0 ;; esac
+  return 1
+}
+
+_agent_restart_executable_exists() {
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    whence -p "$1" >/dev/null 2>&1
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    type -P "$1" >/dev/null 2>&1
+  else
+    command -v "$1" >/dev/null 2>&1
+  fi
+}
+
+_agent_restart_set_current_pid() {
+  # $$ remains the parent interactive shell inside zsh subshell functions.
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    zmodload zsh/system 2>/dev/null || return 1
+    eval 'AGENT_RESTART_WRAPPER_PID=$sysparams[pid]'
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    AGENT_RESTART_WRAPPER_PID=$BASHPID
+  else
+    AGENT_RESTART_WRAPPER_PID=$$
+  fi
+}
+
+_agent_restart_save_function() {
+  _arsf_name=$1
+  _arsf_saved="_agent_restart_original_$_arsf_name"
+  _agent_restart_function_exists "$_arsf_saved" && return 0
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    eval "functions[$_arsf_saved]=\$functions[$_arsf_name]"
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    _arsf_definition=$(declare -f "$_arsf_name") || return 1
+    _arsf_definition=$(printf '%s\n' "$_arsf_definition" | sed "1s/^[^ (]*/$_arsf_saved/")
+    eval "$_arsf_definition"
+  else
+    return 1
+  fi
+}
+
+_agent_restart_invoke() {
+  _ari_client=$1
+  shift
+  _ari_saved="_agent_restart_original_$_ari_client"
+  if _agent_restart_function_exists "$_ari_saved"; then
+    "$_ari_saved" "$@"
+  else
+    command "$_ari_client" "$@"
+  fi
+}
+
+_agent_restart_request_read() {
+  _arr_file=$1
+  AGENT_RESTART_REQUEST_VERSION=
+  AGENT_RESTART_REQUEST_CLIENT=
+  AGENT_RESTART_SESSION_ID=
+  AGENT_RESTART_ACTION=
+  IFS="$(printf '\t')" read -r \
+    AGENT_RESTART_REQUEST_VERSION \
+    AGENT_RESTART_REQUEST_CLIENT \
+    AGENT_RESTART_SESSION_ID \
+    AGENT_RESTART_ACTION < "$_arr_file"
+  [ "$AGENT_RESTART_REQUEST_VERSION" = 1 ] || return 1
+  [ "$AGENT_RESTART_REQUEST_CLIENT" = "$AGENT_RESTART_CLIENT" ] || return 1
+  _agent_restart_uuid "$AGENT_RESTART_SESSION_ID" || return 1
+  case "$AGENT_RESTART_ACTION" in restart|use-aws) return 0 ;; esac
+  return 1
+}
+
+_agent_restart_default_launch() {
+  _ard_client=$1
+  shift
+  case "$_ard_client:$AGENT_RESTART_FIRST" in
+    claude:1) _agent_restart_invoke claude "$@" ;;
+    claude:0)
+      if [ -n "$AGENT_RESTART_SESSION_ID" ]; then _agent_restart_invoke claude --resume "$AGENT_RESTART_SESSION_ID"
+      else _agent_restart_invoke claude
+      fi
+      ;;
+    codex:1) _agent_restart_invoke codex "$@" ;;
+    codex:0)
+      if [ -n "$AGENT_RESTART_SESSION_ID" ]; then _agent_restart_invoke codex resume "$AGENT_RESTART_SESSION_ID"
+      else _agent_restart_invoke codex
+      fi
+      ;;
+  esac
+}
+
+# Public extension point. A wrapper such as use-aws can provide a launch
+# function and inspect AGENT_RESTART_{FIRST,ACTION,SESSION_ID} before each run.
+agent_restart_loop() (
+  AGENT_RESTART_CLIENT=$1
+  _arl_launcher=$2
+  shift 2
+
+  mkdir -p "$RESTART_STATE/requests" "$RESTART_STATE/wrappers" || return 1
+  chmod 700 "$RESTART_STATE" "$RESTART_STATE/requests" "$RESTART_STATE/wrappers" || return 1
+  _arl_request=$(mktemp "$RESTART_STATE/requests/request.XXXXXX") || return 1
+  chmod 600 "$_arl_request" || { rm -f "$_arl_request"; return 1; }
+
+  export AGENT_RESTART_CLIENT
+  export AGENT_RESTART_REQUEST="$_arl_request"
+  _agent_restart_set_current_pid || return 1
+  export AGENT_RESTART_WRAPPER_PID
+  _arl_registry="$RESTART_STATE/wrappers/$AGENT_RESTART_WRAPPER_PID"
+  [ ! -L "$_arl_registry" ] || { rm -f "$_arl_request"; return 1; }
+  printf '1\t%s\t%s\n' "$AGENT_RESTART_CLIENT" "$_arl_request" > "$_arl_registry" || {
+    rm -f "$_arl_request"; return 1;
+  }
+  chmod 600 "$_arl_registry" || { rm -f "$_arl_request" "$_arl_registry"; return 1; }
+  trap 'rm -f "$_arl_request" "$_arl_registry"' EXIT HUP INT TERM
+
+  export AGENT_RESTART_FIRST=1
+  export AGENT_RESTART_ACTION=
+  export AGENT_RESTART_SESSION_ID=
+
+  while :; do
+    "$_arl_launcher" "$AGENT_RESTART_CLIENT" "$@"
+    _arl_rc=$?
+
+    # SIGHUP convention: 128 + 1. Never relaunch on an unrelated HUP, after a
+    # dropped terminal, or without a valid one-shot request from this session.
+    [ "$_arl_rc" -eq 129 ] || return "$_arl_rc"
+    { [ -t 0 ] || [ "${AGENT_RESTART_TESTING:-}" = 1 ]; } || return "$_arl_rc"
+    _agent_restart_request_read "$_arl_request" || return "$_arl_rc"
+    : > "$_arl_request"
+
+    export AGENT_RESTART_FIRST=0
+    export AGENT_RESTART_ACTION
+    export AGENT_RESTART_SESSION_ID
+  done
+)
+
+_agent_restart_claude_interactive() {
+  for _ari_arg in "$@"; do
+    case "$_ari_arg" in
+      -p|--print|-v|--version|-h|--help|--bg|--background) return 1 ;;
+    esac
+  done
+  case "${1:-}" in agents|attach|logs|stop|rm|mcp|plugin|plugins|update) return 1 ;; esac
+  return 0
+}
+
+_agent_restart_codex_interactive() {
+  for _ari_arg in "$@"; do
+    case "$_ari_arg" in -V|--version|-h|--help) return 1 ;; esac
+  done
+  case "${1:-}" in
+    agents|exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|queue|archive|delete|migrate-rollouts|unarchive|cloud|exec-server)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+_agent_restart_define_wrappers() {
+  [ "${AGENT_RESTART_LOADED:-}" = "$RESTART_VERSION" ] && return 0
+  AGENT_RESTART_LOADED=$RESTART_VERSION
+
+  if [ "${AGENT_RESTART_MANAGED_CLAUDE:-}" != 1 ] && _agent_restart_executable_exists claude; then
+    _agent_restart_function_exists claude && _agent_restart_save_function claude
+    claude() {
+      if _agent_restart_claude_interactive "$@"; then
+        agent_restart_loop claude _agent_restart_default_launch "$@"
+      else
+        _agent_restart_invoke claude "$@"
+      fi
+    }
+  fi
+
+  if _agent_restart_executable_exists codex; then
+    _agent_restart_function_exists codex && _agent_restart_save_function codex
+    codex() {
+      if _agent_restart_codex_interactive "$@"; then
+        agent_restart_loop codex _agent_restart_default_launch "$@"
+      else
+        _agent_restart_invoke codex "$@"
+      fi
+    }
+  fi
+}
+
+_restart_descendant_pid() {
+  _rd_root=$1
+  _rd_name=$2
+  ps -eo pid=,ppid=,comm= 2>/dev/null | awk -v root="$_rd_root" -v want="$_rd_name" '
+    {
+      pid=$1; parent[pid]=$2; command=$3
+      sub(/^.*\//, "", command)
+      name[pid]=command
+    }
+    END {
+      for (pid in parent) {
+        current=pid
+        for (depth=0; depth<64 && current && current != root; depth++)
+          current=parent[current]
+        if (current == root && name[pid] == want) { print pid; exit }
+      }
+    }
+  '
+}
+
+_restart_codex_session_pid() {
+  _rcsp_sid=$1
+  _rcsp_lock="$HOME/.codex/thread-writer-locks/$_rcsp_sid.lock"
+
+  if [ -e "$_rcsp_lock" ] && command -v lsof >/dev/null 2>&1; then
+    for _rcsp_pid in $(lsof -t -- "$_rcsp_lock" 2>/dev/null); do
+      _rcsp_command=$(ps -p "$_rcsp_pid" -o comm= 2>/dev/null)
+      case "${_rcsp_command##*/}" in codex) printf '%s\n' "$_rcsp_pid"; return 0 ;; esac
+    done
+  fi
+
+  # Linux fallback where /proc is available and lsof may not be installed.
+  if [ -d /proc ] && [ -e "$_rcsp_lock" ]; then
+    for _rcsp_fd in /proc/[0-9]*/fd/*; do
+      [ "$(readlink "$_rcsp_fd" 2>/dev/null)" = "$_rcsp_lock" ] || continue
+      _rcsp_pid=${_rcsp_fd#/proc/}
+      _rcsp_pid=${_rcsp_pid%%/*}
+      _rcsp_command=$(ps -p "$_rcsp_pid" -o comm= 2>/dev/null)
+      case "${_rcsp_command##*/}" in codex) printf '%s\n' "$_rcsp_pid"; return 0 ;; esac
+    done
+  fi
+  return 1
+}
+
+_restart_registered_request() {
+  _rrr_client=$1
+  _rrr_wrapper=$2
+  _rrr_registry="$RESTART_STATE/wrappers/$_rrr_wrapper"
+  [ -f "$_rrr_registry" ] && [ ! -L "$_rrr_registry" ] && [ -r "$_rrr_registry" ] || return 1
+  _rrr_version=
+  _rrr_registered_client=
+  _rrr_request=
+  IFS="$(printf '\t')" read -r \
+    _rrr_version _rrr_registered_client _rrr_request < "$_rrr_registry"
+  [ "$_rrr_version" = 1 ] || return 1
+  [ "$_rrr_registered_client" = "$_rrr_client" ] || return 1
+  [ -f "$_rrr_request" ] && [ ! -L "$_rrr_request" ] && [ -w "$_rrr_request" ] || return 1
+  printf '%s\n' "$_rrr_request"
+}
+
+_restart_signal_target() {
+  _rst_client=$1
+  _rst_target=${AGENT_RESTART_TARGET_PID:-}
+
+  if [ -z "$_rst_target" ] && [ "$_rst_client" = claude ]; then
+    _rst_target=${CLAUDE_PID:-}
+  fi
+  if [ -z "$_rst_target" ] && [ -n "${AGENT_RESTART_WRAPPER_PID:-}" ]; then
+    _rst_target=$(_restart_descendant_pid "$AGENT_RESTART_WRAPPER_PID" "$_rst_client")
+  fi
+  case "$_rst_target" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_rst_target" 2>/dev/null || return 1
+  kill -HUP "$_rst_target"
+}
+
+_restart_trigger() {
+  _rt_action=${1:-restart}
+  case "$_rt_action" in restart|use-aws) ;; *) printf 'restart: invalid action: %s\n' "$_rt_action" >&2; return 2 ;; esac
+
+  if [ -n "${CODEX_SESSION_ID:-}" ]; then
+    _rt_client=codex
+    _rt_sid=$CODEX_SESSION_ID
+  elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    _rt_client=claude
+    _rt_sid=$CLAUDE_CODE_SESSION_ID
+  else
+    printf 'restart: not running inside Claude Code or Codex CLI\n' >&2
+    return 1
+  fi
+  _agent_restart_uuid "$_rt_sid" || { printf 'restart: invalid live session id\n' >&2; return 1; }
+
+  if [ -n "${AGENT_RESTART_REQUEST:-}" ]; then
+    _rt_request=$AGENT_RESTART_REQUEST
+    [ -f "$_rt_request" ] && [ ! -L "$_rt_request" ] && [ -w "$_rt_request" ] || {
+      printf 'restart: invalid wrapper request file\n' >&2; return 1; }
+    printf '1\t%s\t%s\t%s\n' "$_rt_client" "$_rt_sid" "$_rt_action" > "$_rt_request" || return 1
+    if ! _restart_signal_target "$_rt_client"; then
+      : > "$_rt_request"
+      printf 'restart: could not find the wrapped %s process\n' "$_rt_client" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Codex's ! shell mode is client-side, but it runs through the Codex app
+  # server and intentionally receives no arbitrary launcher variables. The
+  # live session id identifies the lock held by the exact TUI process; its
+  # parent identifies the matching wrapper and private request file.
+  if [ "$_rt_client" = codex ]; then
+    _rt_target=${AGENT_RESTART_TARGET_PID:-}
+    [ -n "$_rt_target" ] || _rt_target=$(_restart_codex_session_pid "$_rt_sid") || {
+      printf 'restart: could not find the live Codex process\n' >&2; return 1;
+    }
+    _rt_wrapper=$(ps -p "$_rt_target" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    case "$_rt_wrapper" in ''|*[!0-9]*) printf 'restart: could not find the Codex wrapper\n' >&2; return 1 ;; esac
+    _rt_request=$(_restart_registered_request codex "$_rt_wrapper") || {
+      printf 'restart: this Codex process was not launched through the restart wrapper\n' >&2; return 1;
+    }
+    printf '1\tcodex\t%s\t%s\n' "$_rt_sid" "$_rt_action" > "$_rt_request" || return 1
+    if ! kill -HUP "$_rt_target"; then
+      : > "$_rt_request"
+      printf 'restart: could not signal the live Codex process\n' >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Compatibility with use-aws releases from before restart was split out.
+  if [ "$_rt_client" = claude ] && [ -n "${CLAUDE_RESTART_REQUEST:-}" ]; then
+    _rt_request=$CLAUDE_RESTART_REQUEST
+    [ -f "$_rt_request" ] && [ ! -L "$_rt_request" ] && [ -w "$_rt_request" ] || {
+      printf 'restart: invalid legacy request file\n' >&2; return 1; }
+    printf '%s' "$_rt_sid" > "$_rt_request" || return 1
+    if ! _restart_signal_target claude; then
+      : > "$_rt_request"
+      printf 'restart: could not find the wrapped claude process\n' >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  printf 'restart: this CLI was not launched through the restart wrapper\n' >&2
+  printf 'restart: open a new terminal after installation, then try again\n' >&2
+  return 1
+}
+
+_restart_remove_block() {
+  _rr_file=$1
+  [ -f "$_rr_file" ] || return 0
+  _rr_tmp="$_rr_file.restart.$$"
+  awk -v begin="$RESTART_BEGIN" -v end="$RESTART_END" '
+    index($0, begin) { skip=1; next }
+    index($0, end)   { skip=0; next }
+    !skip            { print }
+  ' "$_rr_file" > "$_rr_tmp" && mv "$_rr_tmp" "$_rr_file"
+}
+
+_restart_wire_rc() {
+  _rw_file=$1
+  mkdir -p "$(dirname "$_rw_file")" || return 1
+  [ -f "$_rw_file" ] || : > "$_rw_file"
+  _restart_remove_block "$_rw_file" || return 1
+  _rw_old="$_rw_file.restart-old.$$"
+  _rw_new="$_rw_file.restart-new.$$"
+  mv "$_rw_file" "$_rw_old" || return 1
+  {
+    cat "$_rw_old"
+    printf '\n'
+    printf '%s\n' "$RESTART_BEGIN"
+    printf '[ -r "$HOME/.local/share/restart/restart" ] && source "$HOME/.local/share/restart/restart"\n'
+    printf '%s\n' "$RESTART_END"
+  } > "$_rw_new" && mv "$_rw_new" "$_rw_file"
+  _rw_rc=$?
+  [ "$_rw_rc" -eq 0 ] && rm -f "$_rw_old" || mv "$_rw_old" "$_rw_file"
+  return "$_rw_rc"
+}
+
+_restart_rc_files() {
+  case "${SHELL:-}" in
+    */zsh)  printf '%s\n' "$HOME/.zshrc" ;;
+    */bash) printf '%s\n' "$HOME/.bashrc" "$HOME/.bash_profile" ;;
+    *)      return 1 ;;
+  esac
+}
+
+_restart_write_skill() {
+  cat > "$RESTART_HOME/SKILL.md" <<'RESTART_SKILL'
+---
+name: restart
+description: Restart the current Claude Code or Codex CLI and resume the exact live conversation. Use only when the user explicitly asks to restart or relaunch this coding-agent session.
+---
+
+# Restart this session
+
+In Claude Code, this client-side command runs before any model request:
+
+!`restart now`
+
+In Codex, immediately run `restart now` as a shell command and do nothing else.
+If the model or provider is unavailable, the user can bypass the model entirely
+by typing `!restart now` directly in the Codex composer.
+RESTART_SKILL
+}
+
+_restart_link() {
+  _rl_link=$1
+  _rl_target=$2
+  mkdir -p "$(dirname "$_rl_link")" || return 1
+  if [ -L "$_rl_link" ]; then
+    [ "$(readlink "$_rl_link")" = "$_rl_target" ] && return 0
+    rm -f "$_rl_link" || return 1
+  elif [ -e "$_rl_link" ]; then
+    printf 'restart: refusing to replace existing path: %s\n' "$_rl_link" >&2
+    return 1
+  fi
+  ln -s "$_rl_target" "$_rl_link"
+}
+
+_restart_copy_self() {
+  _rcs_target=$1
+  _rcs_source=$0
+  _rcs_tmp="$_rcs_target.new.$$"
+  [ -e "$_rcs_target" ] && [ "$_rcs_source" -ef "$_rcs_target" ] && return 0
+  if [ -f "$_rcs_source" ] && [ -r "$_rcs_source" ]; then
+    cp "$_rcs_source" "$_rcs_tmp" || return 1
+  else
+    command -v curl >/dev/null 2>&1 || { printf 'restart: curl is required for piped installation\n' >&2; return 1; }
+    curl -fsSL "$RESTART_SOURCE_URL" -o "$_rcs_tmp" || return 1
+  fi
+  chmod 755 "$_rcs_tmp" && mv "$_rcs_tmp" "$_rcs_target"
+}
+
+_restart_install() {
+  mkdir -p "$RESTART_HOME" "$(dirname "$RESTART_BIN")" || return 1
+  _restart_copy_self "$RESTART_PROGRAM" || return 1
+  _restart_write_skill || return 1
+
+  _restart_link "$RESTART_BIN" "$RESTART_PROGRAM" || return 1
+  _restart_link "$HOME/.agents/skills/restart" "$RESTART_HOME" || return 1
+  _restart_link "$HOME/.claude/skills/restart" "$RESTART_HOME" || return 1
+
+  _ri_rcs=$(_restart_rc_files) || {
+    printf 'restart: installed, but unsupported login shell: %s\n' "${SHELL:-unknown}" >&2
+    printf 'restart: source %s from your shell startup file\n' "$RESTART_PROGRAM" >&2
+    return 1
+  }
+  printf '%s\n' "$_ri_rcs" | while IFS= read -r _ri_rc; do
+    [ -n "$_ri_rc" ] && _restart_wire_rc "$_ri_rc" || exit 1
+  done || return 1
+
+  printf 'restart %s installed for Claude Code and Codex\n' "$RESTART_VERSION"
+  printf 'open a new terminal, then use /restart in Claude or !restart in Codex\n'
+}
+
+_restart_unlink_if_ours() {
+  _rui_path=$1
+  _rui_target=$2
+  if [ -L "$_rui_path" ] && [ "$(readlink "$_rui_path")" = "$_rui_target" ]; then
+    rm -f "$_rui_path"
+  fi
+}
+
+_restart_uninstall() {
+  _ru_rcs=$(_restart_rc_files 2>/dev/null) || _ru_rcs=
+  printf '%s\n' "$_ru_rcs" | while IFS= read -r _ru_rc; do
+    [ -n "$_ru_rc" ] && _restart_remove_block "$_ru_rc"
+  done
+  _restart_unlink_if_ours "$HOME/.agents/skills/restart" "$RESTART_HOME"
+  _restart_unlink_if_ours "$HOME/.claude/skills/restart" "$RESTART_HOME"
+  _restart_unlink_if_ours "$RESTART_BIN" "$RESTART_PROGRAM"
+  rm -f "$RESTART_HOME/SKILL.md" "$RESTART_PROGRAM"
+  rmdir "$RESTART_HOME" 2>/dev/null || true
+  printf 'restart uninstalled\n'
+}
+
+_restart_status() {
+  _rs_failed=0
+  for _rs_path in \
+    "$RESTART_PROGRAM" \
+    "$RESTART_BIN" \
+    "$HOME/.agents/skills/restart/SKILL.md" \
+    "$HOME/.claude/skills/restart/SKILL.md"
+  do
+    if [ -e "$_rs_path" ]; then printf 'ok  %s\n' "$_rs_path"
+    else printf 'missing  %s\n' "$_rs_path"; _rs_failed=1
+    fi
+  done
+  _rs_rcs=$(_restart_rc_files 2>/dev/null) || _rs_rcs=
+  printf '%s\n' "$_rs_rcs" | while IFS= read -r _rs_rc; do
+    [ -z "$_rs_rc" ] || grep -qF "$RESTART_BEGIN" "$_rs_rc" 2>/dev/null || printf 'missing wiring  %s\n' "$_rs_rc"
+  done
+  return "$_rs_failed"
+}
+
+_restart_help() {
+  cat <<'RESTART_HELP'
+restart — restart Claude Code or Codex and resume the exact conversation
+
+Inside Claude Code:  /restart
+Inside Codex:        !restart
+
+Commands:
+  restart install      install or repair wrappers and both skills
+  restart status       show installation state
+  restart uninstall    remove restart-owned files and shell wiring
+  restart help         show this help
+RESTART_HELP
+}
+
+_restart_main() {
+  case "${1:-}" in
+    '')           if [ "${0##*/}" = restart ] && [ -n "${AGENT_RESTART_REQUEST:-}${CLAUDE_RESTART_REQUEST:-}${CODEX_SESSION_ID:-}${CLAUDE_CODE_SESSION_ID:-}" ]; then _restart_trigger restart; else _restart_install; fi ;;
+    now)          _restart_trigger restart ;;
+    use-aws)      _restart_trigger use-aws ;;
+    install)      _restart_install ;;
+    status)       _restart_status ;;
+    uninstall)    _restart_uninstall ;;
+    help|-h|--help) _restart_help ;;
+    version|-v|--version) printf '%s\n' "$RESTART_VERSION" ;;
+    *) printf 'restart: unknown command: %s\n' "$1" >&2; _restart_help >&2; return 2 ;;
+  esac
+}
+
+_restart_sourced=0
+if [ -n "${ZSH_VERSION:-}" ]; then
+  case "${ZSH_EVAL_CONTEXT:-}" in *:file) _restart_sourced=1 ;; esac
+elif [ -n "${BASH_VERSION:-}" ]; then
+  [ "${BASH_SOURCE:-$0}" != "$0" ] && _restart_sourced=1
+fi
+
+if [ "$_restart_sourced" -eq 1 ]; then
+  [ "${AGENT_RESTART_LIBRARY_ONLY:-}" = 1 ] || _agent_restart_define_wrappers
+  unset _restart_sourced
+  return 0
+fi
+
+_restart_main "$@"
