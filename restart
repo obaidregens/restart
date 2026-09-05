@@ -280,12 +280,14 @@ _restart_trigger() {
   _rt_action=${1:-restart}
   case "$_rt_action" in restart|use-aws) ;; *) printf 'restart: invalid action: %s\n' "$_rt_action" >&2; return 2 ;; esac
 
-  if [ -n "${CODEX_SESSION_ID:-}" ]; then
-    _rt_client=codex
-    _rt_sid=$CODEX_SESSION_ID
-  elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  # Prefer Claude when both are present: a Claude process launched from an
+  # existing Codex environment legitimately inherits Codex's outer marker.
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     _rt_client=claude
     _rt_sid=$CLAUDE_CODE_SESSION_ID
+  elif [ -n "${CODEX_SESSION_ID:-}" ]; then
+    _rt_client=codex
+    _rt_sid=$CODEX_SESSION_ID
   else
     printf 'restart: not running inside Claude Code or Codex CLI\n' >&2
     return 1
